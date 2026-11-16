@@ -1,111 +1,151 @@
-import streamlit as st
-import pandas as pd
-import qrcode
-from io import BytesIO
-from datetime import datetime
+"""QR-Code Classroom Attendance System - Streamlit app."""
 import os
 
-# Page configuration
-st.set_page_config(
-    page_title="QR Attendance System - University of Gwadar",
-    page_icon="🎓",
-    layout="wide"
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import core
+
+st.set_page_config(page_title="QR Attendance System", page_icon="✅", layout="wide")
+
+
+def get_secret() -> str:
+    try:
+        if "QR_SECRET" in st.secrets:
+            return st.secrets["QR_SECRET"]
+    except Exception:
+        pass
+    return os.environ.get("QR_SECRET", core.DEFAULT_SECRET)
+
+
+SECRET = get_secret()
+
+
+@st.cache_data
+def load_default_students() -> pd.DataFrame:
+    return pd.read_csv("students.csv", dtype=str)
+
+
+# ---------- Session state ----------
+if "log" not in st.session_state:
+    st.session_state.log = pd.DataFrame(columns=core.LOG_COLUMNS)
+if "students" not in st.session_state:
+    st.session_state.students = load_default_students()
+
+students: pd.DataFrame = st.session_state.students
+
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.title("✅ QR Attendance")
+    st.caption("Computer Vision & AI Module\nSupervisor: Mr. Zeeshan")
+    course = st.text_input("Course / Session", value="Computer Vision & AI")
+    st.metric("Registered students", len(students))
+    today = core.now().strftime("%Y-%m-%d")
+    present_today = (st.session_state.log["date"] == today).sum()
+    st.metric("Present today", int(present_today))
+    if SECRET == core.DEFAULT_SECRET:
+        st.warning("Using the demo secret. Set QR_SECRET in Secrets for real use.")
+
+tab_scan, tab_log, tab_students, tab_about = st.tabs(
+    ["📷 Scan Attendance", "📋 Attendance Log", "🎓 Students & QR Cards", "ℹ️ About"]
 )
 
-# Header info
-st.title("🎓 QR Code Classroom Attendance System")
-st.markdown("### Department of Computer Science | University of Gwadar")
-st.markdown("---")
+# ---------- Scan ----------
+with tab_scan:
+    st.subheader("Scan a student QR card")
+    mode = st.radio("Input", ["Webcam", "Upload image"], horizontal=True)
+    if mode == "Webcam":
+        img_file = st.camera_input("Hold the QR card steady in front of the camera, then take a photo")
+    else:
+        img_file = st.file_uploader("Upload a photo of the QR card", type=["png", "jpg", "jpeg"])
 
-# Sidebar Project Metadata
-with st.sidebar:
-    st.header("📋 Project Details")
-    st.markdown("**Group Leader:** Irfan Ali")
-    st.markdown("**Members:** Sharaf Jan, Qubad Bano, Salma, Nadia")
-    st.markdown("**Supervisor:** Mr. Zeeshan")
-    st.markdown("---")
-    st.info("Upload or generate student IDs, use your webcam or upload QR snapshots to log attendance instantly.")
+    if img_file is not None:
+        data = np.frombuffer(img_file.getvalue(), np.uint8)
+        frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        found = core.decode_image(frame)
 
-# Initialize Attendance File
-ATTENDANCE_FILE = "attendance_log.csv"
-if not os.path.exists(ATTENDANCE_FILE):
-    df_init = pd.DataFrame(columns=["Student_ID", "Name", "Date", "Time"])
-    df_init.to_csv(ATTENDANCE_FILE, index=False)
+        if not found:
+            st.error("No QR code detected. Move closer, improve lighting, and try again.")
+        for payload, pts in found:
+            sid = core.verify_payload(payload, SECRET)
+            match = students[students["student_id"] == sid] if sid else students.iloc[0:0]
 
-# Tabs for workflow
-tab1, tab2, tab3 = st.tabs(["1. Student ID Generator", "2. Attendance Scanner / Logger", "3. View Attendance Logs"])
-
-with tab1:
-    st.subheader("Generate Student QR Code ID Cards")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        s_id = st.text_input("Student Registration ID", value="UG-IT-2026-001")
-        s_name = st.text_input("Student Full Name", value="Irfan Ali")
-        generate_btn = st.button("Generate QR Code")
-        
-    with col2:
-        if generate_btn:
-            data_string = f"ID:{s_id},Name:{s_name}"
-            img = qrcode.make(data_string)
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            byte_im = buf.getvalue()
-            
-            st.image(byte_im, caption=f"QR ID Card for {s_name} ({s_id})", width=200)
-            st.download_button(
-                label="Download QR Badge",
-                data=byte_im,
-                file_name=f"{s_id}_qr.png",
-                mime="image/png"
-            )
-
-with tab2:
-    st.subheader("Simulated / Live Attendance Scanner")
-    st.markdown("Enter student credentials or scan badge to record attendance securely.")
-    
-    with st.form("attendance_form"):
-        scan_id = st.text_input("Enter Student ID (e.g., UG-IT-2026-001)")
-        scan_name = st.text_input("Enter Student Name (e.g., Irfan Ali)")
-        submit_attendance = st.form_submit_button("Mark Attendance")
-        
-        if submit_attendance:
-            if scan_id and scan_name:
-                now = datetime.now()
-                curr_date = now.strftime("%Y-%m-%d")
-                curr_time = now.strftime("%H:%M:%S")
-                
-                df_att = pd.read_csv(ATTENDANCE_FILE)
-                # Check duplicate
-                exists = df_att[(df_att["Student_ID"] == scan_id) & (df_att["Date"] == curr_date)]
-                
-                if exists.empty:
-                    new_entry = pd.DataFrame({"Student_ID": [scan_id], "Name": [scan_name], "Date": [curr_date], "Time": [curr_time]})
-                    df_att = pd.concat([df_att, new_entry], ignore_index=True)
-                    df_att.to_csv(ATTENDANCE_FILE, index=False)
-                    st.success(f"Attendance successfully recorded for {scan_name} ({scan_id}) at {curr_time}!")
-                else:
-                    st.warning(f"Attendance for {scan_name} ({scan_id}) has already been marked today ({curr_date}).")
+            if sid is None:
+                st.error("❌ Invalid or tampered QR code. Attendance NOT recorded.")
+                st.image(core.annotate(frame, pts, "INVALID", False)[:, :, ::-1])
+            elif match.empty:
+                st.error(f"❌ Signature valid but `{sid}` is not in the student list.")
+                st.image(core.annotate(frame, pts, "UNREGISTERED", False)[:, :, ::-1])
             else:
-                st.error("Please provide both Student ID and Name.")
+                student = match.iloc[0]
+                st.session_state.log, status = core.mark_attendance(st.session_state.log, student, course)
+                if status == "marked":
+                    st.success(f"✅ Welcome, **{student['name']}** ({student['student_id']})! Attendance marked.")
+                    st.balloons()
+                    label = f"{student['name']} - PRESENT"
+                else:
+                    st.warning(f"⚠️ **{student['name']}** already checked in today for this course.")
+                    label = f"{student['name']} - DUPLICATE"
+                st.image(core.annotate(frame, pts, label, status == "marked")[:, :, ::-1])
 
-with tab3:
-    st.subheader("Live Attendance Records & Reports")
-    if os.path.exists(ATTENDANCE_FILE):
-        df_records = pd.read_csv(ATTENDANCE_FILE)
-        st.dataframe(df_records, use_container_width=True)
-        
-        if not df_records.empty:
-            csv_data = df_records.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Complete Attendance CSV",
-                data=csv_data,
-                file_name="classroom_attendance_report.csv",
-                mime="text/csv"
-            )
-            
-            if st.button("Clear Attendance Log"):
-                pd.DataFrame(columns=["Student_ID", "Name", "Date", "Time"]).to_csv(ATTENDANCE_FILE, index=False)
-                st.rerun()
+# ---------- Log ----------
+with tab_log:
+    st.subheader("Attendance records")
+    log = st.session_state.log
+    c1, c2 = st.columns(2)
+    dates = ["All"] + sorted(log["date"].unique().tolist(), reverse=True)
+    sel = c1.selectbox("Date", dates)
+    view = log if sel == "All" else log[log["date"] == sel]
+    st.dataframe(view, width="stretch", hide_index=True)
+
+    absent_date = today if sel == "All" else sel
+    present_ids = set(log[(log["date"] == absent_date) & (log["course"] == course)]["student_id"])
+    absent = students[~students["student_id"].isin(present_ids)][["student_id", "name"]]
+    with st.expander(f"Absent on {absent_date} ({len(absent)})"):
+        st.dataframe(absent, width="stretch", hide_index=True)
+
+    st.download_button("⬇️ Download attendance CSV", view.to_csv(index=False), "attendance_log.csv", "text/csv")
+    if st.button("🗑️ Clear log (this session)"):
+        st.session_state.log = pd.DataFrame(columns=core.LOG_COLUMNS)
+        st.rerun()
+    st.caption("Streamlit Cloud storage is temporary. Download the CSV after each class.")
+
+# ---------- Students ----------
+with tab_students:
+    st.subheader("Student dataset")
+    up = st.file_uploader(
+        "Replace the dataset with your own CSV (columns: student_id,name,department,semester,email)", type="csv"
+    )
+    if up is not None:
+        new = pd.read_csv(up, dtype=str)
+        need = {"student_id", "name", "department", "semester"}
+        if need.issubset(new.columns):
+            st.session_state.students = new
+            students = new
+            st.success(f"Loaded {len(new)} students.")
         else:
-            st.info("No attendance records found yet.")
+            st.error(f"CSV must contain columns: {sorted(need)}")
+    st.dataframe(students, width="stretch", hide_index=True)
+
+    st.subheader("QR ID cards")
+    pick = st.selectbox("Preview a card", students["student_id"] + " — " + students["name"])
+    row = students[students["student_id"] == pick.split(" — ")[0]].iloc[0]
+    st.image(core.make_card(row, SECRET), width=520)
+    st.download_button("⬇️ Download ALL cards (ZIP)", core.cards_zip(students, SECRET), "qr_cards.zip", "application/zip")
+
+# ---------- About ----------
+with tab_about:
+    st.markdown(
+        """
+**QR-Code Classroom Attendance System**  
+Group: Irfan Ali (Leader), Sharaf Jan, Qubad Bano, Salma, Nadia · Supervisor: Mr. Zeeshan
+
+**How it works**
+1. Each student gets a printed card with a QR code containing `student_id.signature` (HMAC-SHA256), so forged codes are rejected.
+2. The camera image is decoded with `pyzbar` (OpenCV fallback).
+3. The ID is verified, checked against the student list, and duplicate check-ins for the same day and course are blocked.
+4. The record is added to the log with a timestamp and can be downloaded as CSV.
+        """
+    )
